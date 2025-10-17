@@ -6,6 +6,7 @@ import { ItemsModule } from './items/items.module';
 import { TypeOrmModule } from '@nestjs/typeorm';
 
 import { Item } from './items/item.entity';
+import { CollabModule } from './collab/collab.module';
 
 @Module({
     imports: [
@@ -23,6 +24,7 @@ import { Item } from './items/item.entity';
         autoLoadEntities: true,
       synchronize: true, // must be false in production
     }),
+    CollabModule,
     ],
     controllers: [AppController],
     providers: [AppService],
