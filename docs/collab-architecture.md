@@ -228,3 +228,13 @@ socket.emit('store:patch', {
 - Start dev: `npm run start:dev` di folder `jamal-be`.
 - Uji WS: connect ke `ws://localhost:3000/collab`, `join`, `store:get`, `store:set`.
 - Recover konflik: kirim `store:get` untuk sync, hitung ulang perubahan, kirim `store:set` dengan versi benar.
+
+## 14. Referensi
+
+- TLStore: https://tldraw.dev/reference/tlschema/TLStore
+- TLRecord: https://tldraw.dev/reference/tlschema/TLRecord
+- TLStoreProps: https://tldraw.dev/reference/tlschema/TLStoreProps
+- NestJS WebSockets: https://docs.nestjs.com/websockets/gateways
+- Socket.IO server/client: https://socket.io/docs/v4/
+- TypeORM: https://typeorm.io
+- Neon Postgres: https://neon.tech/docs/connect/connect-with-node
