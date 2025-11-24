@@ -1,31 +1,24 @@
-# Kolaborasi Realtime Whiteboard (TLDraw) — Desain Teknis
+# Kolaborasi Realtime Whiteboard (FE Quick Guide)
 
-Dokumen ini mendeskripsikan arsitektur kolaborasi realtime berbasis NestJS + Socket.IO, penyimpanan TLDraw Store pada Neon Postgres, serta kontrak payload dan strategi konsistensi.
+Dokumen singkat ini menjelaskan apa yang perlu diketahui tim frontend untuk terhubung, menampilkan, dan mensinkronkan kanvas TLDraw secara realtime dengan backend (NestJS + Socket.IO). Fokus: koneksi, event contract, contoh payload, dan kapan memakai REST vs WebSocket.
 
-## 1. Ringkasan
+## 1. Ringkasan singkat (untuk FE)
 
-- Tujuan: mendukung kolaborasi multi-user untuk kanvas whiteboard berbasis model data TLDraw (TLStore/TLRecord).
-- Komponen utama:
-  - Gateway WebSocket (Socket.IO, namespace `/collab`) untuk sinkronisasi realtime.
-  - Service kolaborasi sebagai orchestrator persistence dan concurrency control.
-  - Postgres (Neon) sebagai storage persisten dengan skema `drawings`.
-- Pattern sinkronisasi: snapshot penuh (MVP) dengan opsi patch delta di iterasi berikutnya.
+- Tujuan: FE dapat menampilkan dan berkolaborasi pada kanvas TLDraw yang disimpan server, dengan model snapshot + optional patch.
+- Gunakan WebSocket (`/collab`) untuk realtime sync (join, get snapshot, set/patch updates).
+- Gunakan REST `/drawings` untuk membuat/menyimpan/menemukan kanvas (fallback, browse, dan bootstrapping).
 
 ## 2. Data Model
 
-### 2.1 Tabel `drawings`
+### 2.1 Data yang disimpan (ringkas)
 
-- id: uuid (PK)
-- room_id: text UNIQUE — identitas ruang/kanvas
-- name: text NULL — nama tampilan ruang
-- store: jsonb — snapshot TLStore (minimal: `{ schemaVersion, records }`)
-- version: integer — counter untuk optimistic concurrency
-- created_at, updated_at: timestamptz
+- `drawings` menyimpan snapshot TLStore per kanvas:
+  - `id` (uuid) — primary key
+  - `room_id` (text, unique) — string identifier yang FE gunakan untuk join (contoh: `room_123`). Note: server saat ini menerima `room_id` nullable to allow safe migrations/backfills; production idealnya `NOT NULL`.
+  - `store` (jsonb) — TLStore snapshot: `{ schemaVersion, records }
+  - `version` (integer) — optimistic concurrency counter (increment setiap sukses persist)
 
-Rasional:
-
-- `jsonb` menyederhanakan penyimpanan TLStore yang beraneka tipe record (shape/page/asset/binding/…)
-- `version` memungkinkan validasi urutan update antar klien.
+Rasional singkat untuk FE: server mengirim snapshot + version saat client join; setiap update harus menyertakan `version = current + 1` untuk accepted updates.
 
 ### 2.2 TLStore (persisted)
 
@@ -35,40 +28,64 @@ Rasional:
 
 Referensi TLDraw: TLRecord, TLStore, TLStoreProps — server menyimpan snapshot/patch yang valid terhadap schema.
 
-## 3. Kontrak WebSocket
+## 3. WebSocket contract (FE-focused)
 
 Namespace: `/collab`
 
-Events (client -> server):
+Core events (client -> server):
 
 - `join` { roomId: string }
+  - Action: client asks to join a room. Server responds with `store:state` (current snapshot + version).
+
 - `store:get` { roomId: string }
+  - Action: request the latest snapshot for a room (useful for explicit re-sync).
+
 - `store:set` { roomId: string, store: TLStore, version: number }
-  - Aturan: `version` harus `currentVersion + 1` (optimistic concurrency)
-- `store:patch` { roomId: string, baseVersion: number, changes: { put?: TLRecord[], update?: { id, after }[], remove?: { id }[] } }
-  - Lebih efisien: hanya kirim delta. Server merge dan bump version.
+  - Use when sending a full snapshot. `version` must equal `currentVersion + 1` else server rejects with `VERSION_CONFLICT`.
 
-Events (server -> client):
+- `store:patch` { roomId: string, baseVersion: number, changes }
+  - Use when sending a delta (put/update/remove). `baseVersion` is the version the patch is based on; server will apply and bump version if valid.
 
-- `connected` { ok: true }
-- `store:state` { roomId, store, version } — snapshot saat join / get
-- `store:updated` { roomId, store, version } — broadcast setelah update sukses
+Core events (server -> client):
 
-Error policy:
+- `store:state` { roomId, store, version } — initial snapshot returned after `join` or `store:get`.
+- `store:updated` { roomId, store, version } — broadcast to room after a successful update/patch.
+- `error` { code, message } — non-2xx responses for event operations.
 
-- Kesalahan dikirim via event `error` { code, message }.
-  - `UNAUTHENTICATED` — API key salah
-  - `PAYLOAD_TOO_LARGE` — payload melebihi limit (set: set=~2MB, patch=~1MB)
-  - `VERSION_CONFLICT` — versi tidak cocok, lakukan re-sync
-  - `INVALID_PAYLOAD` — format/payload tidak valid
-  - `NOT_FOUND` — room tidak ditemukan
-  - `INTERNAL_ERROR` — error tidak terklasifikasi
+Common error codes (FE handling):
 
-## 4. Alur Utama
+- `UNAUTHENTICATED` — fail handshake (invalid API key). Client should stop trying and surface login.
+- `VERSION_CONFLICT` — client should `store:get` to re-sync and re-apply local changes.
+- `PAYLOAD_TOO_LARGE` — compress/convert to patch or show user an upload error.
+- `NOT_FOUND` — room missing (show 404 / create new canvas flow).
 
-1. Client connect -> `join(roomId)` -> server join socket ke room + kirim `store:state` (snapshot & version).
-2. Client edit -> hitung `nextStore`, `nextVersion = currentVersion + 1` -> `store:set`.
-3. Server validasi versi dan persist -> broadcast `store:updated` ke seluruh member room.
+Notes for FE implementer:
+
+- Always on `join`: expect `store:state` as single source-of-truth and set local TLStore and version.
+- Use optimistic updates in UI, but on server `VERSION_CONFLICT` re-sync and merge local edits.
+- Prefer `store:patch` for frequent small edits; use `store:set` for save/checkpoint operations.
+
+## 4. Typical FE flow (quick)
+
+1. Connect socket:
+
+```js
+const socket = io('https://api.example.com/collab', { auth: { apiKey } });
+socket.emit('join', { roomId: 'room_123' });
+socket.on('store:state', s => {
+  // set local TLStore and currentVersion = s.version
+});
+```
+
+2. User edits:
+
+- build a patch (or snapshot)
+- for patch: `socket.emit('store:patch', { roomId, baseVersion, changes })`
+- for snapshot: `socket.emit('store:set', { roomId, version: current + 1, store })`
+
+3. On server success you will receive `store:updated` from server with the new snapshot + version.
+
+4. On `VERSION_CONFLICT` -> call `store:get` or `join` to re-sync snapshot and re-apply local diffs.
 
 ## 5. Konsistensi & Konflik
 
@@ -76,12 +93,11 @@ Error policy:
 - Jika konflik (versi tidak berurutan): tolak update dan minta klien re-sync snapshot lalu kirim ulang perubahan.
 - Iterasi lanjut: patch-level merge (field-wise or last-writer-wins) dapat ditambahkan untuk mengurangi konflik.
 
-## 6. Keamanan
+## 5. Security & limits (for FE)
 
-- Auth: WebSocket handshake menggunakan API key `COLLAB_API_KEY` (Socket.IO auth atau query string).
-- CORS: batasi origin di production.
-- Payload limits: `store:set` ~2MB, `store:patch` ~1MB.
-- Validation: server memvalidasi minimal schema TLStore/TLRecord (id, typeName) sebelum persist.
+- Auth: pass API key in Socket.IO handshake via `auth: { apiKey }` (do not put secrets in client bundle; use short-lived tokens when possible).
+- Payload size: keep snapshots small; prefer patching. Server may return `PAYLOAD_TOO_LARGE`.
+- Validation: server validates TLStore shape minimally — always send well-formed TLRecords.
 
 ## 7. Panduan FE (contoh Socket.IO)
 
@@ -121,22 +137,39 @@ socket.emit('store:patch', {
 });
 ```
 
-## 8. Skalabilitas
 
-- Socket horizontal scaling: gunakan adapter Redis untuk Socket.IO (pub/sub) agar broadcast antar instance.
-- DB: index `(room_id)`, materialisasi tambahan (mis. (room_id, updated_at)) bila diperlukan.
-- Snapshot vs Patch: beralih ke patch delta untuk mengurangi bandwidth pada room aktif.
+## 6. REST endpoints (when to use them)
+
+- `GET /drawings` — list available drawings (FE: used for browser/explore pages)
+- `POST /drawings` — create a new drawing (returns id)
+- `GET /drawings/:id` — fetch a persisted snapshot (useful when bootstrapping without WS)
+- `PUT /drawings/:id` — replace persisted snapshot
+- `DELETE /drawings/:id` — delete canvas
+
+FE guidance: create via REST or provide a UI to create new drawing; once created, open socket and `join` with the returned `id`.
 
 ## 9. Observability
 
 - Logging event penting (join, set) beserta ukuran payload.
 - Metric: jumlah user per room, frekuensi update, rata-rata ukuran store, konflik versi.
 
-## 10. Testing
+## 7. Scripts & quick commands (dev)
 
-- Unit test: service `setStore`, `getOrCreate`.
-- E2E: dua klien melakukan join pada room sama, update berurutan -> keduanya menerima `store:updated` dengan versi yang meningkat.
-- Negative: kirim `store:set` dengan `version` yang salah -> server menolak.
+There are small dev scripts in the project root for local/dev ops:
+
+- `scripts/add_room_id_column.js` — safe migration helper that ensures `room_id` column exists and creates an index. Run locally if your DB needs the column:
+
+```bash
+node -r dotenv/config scripts/add_room_id_column.js
+```
+
+- `scripts/ws_drawings_smoke.js` — connects to the running server, creates a temporary drawing, joins it and validates `drawing:patch` roundtrip (useful for quick smoke test):
+
+```bash
+node -r dotenv/config scripts/ws_drawings_smoke.js
+```
+
+Notes: these scripts read `DATABASE_URL` and other env vars via `.env`; do not commit secrets and keep them in CI secret store.
 
 ## 11. Payload & Schema (contoh)
 
@@ -222,12 +255,31 @@ socket.emit('store:patch', {
 - Presence channel terpisah (cursor/camera) tanpa persist (Redis/memory only).
 - Retensi & backup: snapshot harian per room (opsional).
 
-## 13. Runbook
 
-- Config env: `DATABASE_URL` Neon Postgres (SSL required).
-- Start dev: `npm run start:dev` di folder `jamal-be`.
-- Uji WS: connect ke `ws://localhost:3000/collab`, `join`, `store:get`, `store:set`.
-- Recover konflik: kirim `store:get` untuk sync, hitung ulang perubahan, kirim `store:set` dengan versi benar.
+## 8. Runbook (quick)
+
+- Set env: `DATABASE_URL` and `COLLAB_API_KEY` (for local dev handshake if required).
+- Start server:
+
+```bash
+npm run start:dev
+```
+
+- FE quick debug flow:
+  - Create a drawing via `POST /drawings` or use an existing id.
+  - Connect socket to `/collab` and `join` that `roomId`.
+  - Expect `store:state` then send `store:patch` or `store:set`.
+
+If you hit `VERSION_CONFLICT`: call `store:get` and re-apply local diffs.
+
+---
+
+If you want, I can also:
+
+- Standardize naming in code/docs (prefer `store:*` events under `/collab`) and remove or document `DrawingsGateway` names (`joinDrawing`, `drawing:update`) to avoid confusion for FE; or
+- Add a short `docs/collab-quick-start.md` that contains only the code snippets FE needs to copy.
+
+Tell me if you want standardization (I can patch code + docs) or just keep both event names documented.
 
 ## 14. Referensi
 

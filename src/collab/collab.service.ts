@@ -3,6 +3,8 @@ import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { Drawing } from './drawing.entity';
 import { z } from 'zod';
+import { createTLSchema } from '@tldraw/tlschema';
+import { Store } from '@tldraw/store';
 
 export type TLStore = {
   schemaVersion?: number;
@@ -27,6 +29,20 @@ export class CollabService {
     private readonly drawings: Repository<Drawing>,
   ) {}
 
+  // TLSchema + Store for full validation
+  private readonly tlschema = createTLSchema();
+  // Minimal TLStoreProps required by Store constructor — asset functions stubbed for validation only
+  private readonly storeProps: any = {
+    defaultName: 'Untitled',
+    assets: {
+      upload: async () => ({ src: '' }),
+      resolve: async () => '',
+      remove: async () => {},
+    },
+    onMount: () => {},
+    collaboration: { status: null },
+  };
+
   private emptyStore(): TLStore {
     return { schemaVersion: 1, records: {} };
   }
@@ -47,10 +63,18 @@ export class CollabService {
 
   // Set full store with optimistic concurrency (version must be prev+1)
   async setStore(roomId: string, nextStore: TLStore, nextVersion: number): Promise<Drawing> {
-    // Validate payload
-    const parsed = TLStoreSchema.safeParse(nextStore);
-    if (!parsed.success) {
-      throw new BadRequestException('Invalid TLStore payload');
+    // Validate payload using official TLSchema/Store
+    try {
+      // create Store instance for validation; supply minimal props
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const store = new Store({ schema: this.tlschema as any, props: this.storeProps as any } as any);
+      // loadStoreSnapshot will validate records according to TLSchema
+      // Accept either serialized store or snapshot shapes
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (store as any).loadStoreSnapshot(nextStore as any);
+      // If no error thrown, snapshot is valid
+    } catch (err) {
+      throw new BadRequestException(`Invalid TLStore payload: ${err?.message ?? err}`);
     }
 
     const current = await this.drawings.findOne({ where: { roomId } });
@@ -64,7 +88,7 @@ export class CollabService {
     const result = await this.drawings
       .createQueryBuilder()
       .update(Drawing)
-      .set({ store: parsed.data as any, version: nextVersion })
+      .set({ store: nextStore as any, version: nextVersion })
       .where('room_id = :roomId AND version = :version', { roomId, version: expectedPrev })
       .returning('*')
       .execute();
@@ -93,43 +117,58 @@ export class CollabService {
       throw new ConflictException(`Version conflict. current=${current.version}, base=${baseVersion}`);
     }
 
-    // Start from validated snapshot
-    const curParsed = TLStoreSchema.parse(current.store ?? {});
-    const next = { ...curParsed, records: { ...curParsed.records } } as TLStore;
+    // Apply patch using TLSchema-backed Store to validate
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const store = new Store({ schema: this.tlschema as any, props: this.storeProps as any } as any);
+      // load current snapshot
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (store as any).loadStoreSnapshot(current.store as any);
 
-    // put
-    for (const rec of changes.put ?? []) {
-      const val = TLRecordSchema.safeParse(rec);
-      if (!val.success) throw new BadRequestException('Invalid record in put');
-      next.records![val.data.id] = val.data;
-    }
-    // update (replace by id with provided fields)
-    for (const upd of changes.update ?? []) {
-      if (!upd?.id || typeof upd.after !== 'object') throw new BadRequestException('Invalid update entry');
-      const merged = { ...(next.records?.[upd.id] ?? {}), ...upd.after };
-      const val = TLRecordSchema.safeParse(merged);
-      if (!val.success) throw new BadRequestException('Invalid record in update');
-      next.records![upd.id] = val.data;
-    }
-    // remove
-    for (const rem of changes.remove ?? []) {
-      if (!rem?.id) throw new BadRequestException('Invalid remove entry');
-      if (next.records) delete next.records[rem.id];
-    }
+      // apply puts
+      if (changes.put && changes.put.length > 0) {
+        // store.put will validate records
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        (store as any).put(changes.put as any[]);
+      }
 
-    const nextVersion = current.version + 1;
-    const result = await this.drawings
-      .createQueryBuilder()
-      .update(Drawing)
-      .set({ store: next as any, version: nextVersion })
-      .where('room_id = :roomId AND version = :version', { roomId, version: baseVersion })
-      .returning('*')
-      .execute();
+      // apply updates
+      for (const upd of changes.update ?? []) {
+        if (!upd?.id || typeof upd.after !== 'object') throw new BadRequestException('Invalid update entry');
+        const existing = (store as any).get(upd.id);
+        const merged = { ...(existing ?? {}), ...upd.after };
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        (store as any).put([merged as any]);
+      }
 
-    if (result.affected !== 1) {
-      throw new ConflictException('Concurrent update detected');
+      // apply removes
+      if (changes.remove && changes.remove.length > 0) {
+        const ids = changes.remove.map((r) => r.id);
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        (store as any).remove(ids as any[]);
+      }
+
+      // get snapshot after changes and persist
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const snapshot = (store as any).getStoreSnapshot();
+      const nextVersion = current.version + 1;
+
+      const result = await this.drawings
+        .createQueryBuilder()
+        .update(Drawing)
+        .set({ store: snapshot as any, version: nextVersion })
+        .where('room_id = :roomId AND version = :version', { roomId, version: baseVersion })
+        .returning('*')
+        .execute();
+
+      if (result.affected !== 1) {
+        throw new ConflictException('Concurrent update detected');
+      }
+
+      return result.raw[0] as Drawing;
+    } catch (err) {
+      if (err instanceof BadRequestException) throw err;
+      throw new BadRequestException(`Invalid patch or records: ${err?.message ?? err}`);
     }
-
-    return result.raw[0] as Drawing;
   }
 }
