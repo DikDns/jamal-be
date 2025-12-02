@@ -6,8 +6,8 @@ export class Drawing {
   id!: string;
 
   @Index({ unique: true })
-  @Column({ name: 'room_id', type: 'text', unique: true })
-  roomId!: string;
+  @Column({ name: 'room_id', type: 'text', unique: true, nullable: true })
+  roomId?: string;
 
   @Column({ type: 'text', nullable: true })
   name?: string;
