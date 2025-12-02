@@ -7,6 +7,6 @@ export class AppController {
 
   @Get()
   async getTable() {
-    return this.appService.getTable('playing_with_neon');
+    return 'ke /items';
   }
 }
