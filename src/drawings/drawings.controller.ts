@@ -1,7 +1,9 @@
-import { Controller, Get, Post, Put, Delete, Param, Body } from '@nestjs/common';
+import { Controller, Get, Post, Put, Delete, Param, Body, UseGuards } from '@nestjs/common';
 import { DrawingsService } from './drawings.service';
+import { ApiKeyGuard } from '../common/guards/api-key.guard';
 
 @Controller('drawings')
+@UseGuards(ApiKeyGuard)
 export class DrawingsController {
   constructor(private readonly svc: DrawingsService) {}
 

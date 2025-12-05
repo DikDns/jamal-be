@@ -34,14 +34,55 @@ export class CollabGateway implements OnGatewayConnection {
   constructor(private readonly collab: CollabService) {}
 
   handleConnection(client: Socket) {
-    // Simple API key check from headers/query for auth
-    const apiKey = (client.handshake.auth?.apiKey || client.handshake.query?.apiKey) as string | undefined;
+    // Strict auth validation: accept only auth object, Authorization header, or cookies
+    // REJECT query params (security: API key must not be in URL)
     const expected = process.env.COLLAB_API_KEY;
-    if (expected && apiKey !== expected) {
-      client.emit('error', { code: 'UNAUTHENTICATED', message: 'Invalid API key' });
+    if (!expected) {
+      // No API key required; allow connection
+      client.emit('connected', { ok: true });
+      return;
+    }
+
+    let apiKey: string | undefined;
+
+    // 1. Check socket.io auth object
+    apiKey = client.handshake.auth?.apiKey || client.handshake.auth?.collabKey;
+
+    // 2. Check Authorization header (Bearer token)
+    if (!apiKey) {
+      const authHeader = client.handshake.headers?.authorization;
+      if (authHeader?.startsWith('Bearer ')) {
+        apiKey = authHeader.slice(7);
+      }
+    }
+
+    // 3. Check cookies (HttpOnly cookie named 'collabKey' or 'apiKey')
+    if (!apiKey && client.handshake.headers?.cookie) {
+      const cookies = client.handshake.headers.cookie
+        .split(';')
+        .map((c) => c.trim())
+        .reduce((acc, c) => {
+          const [key, val] = c.split('=');
+          acc[key] = val;
+          return acc;
+        }, {} as Record<string, string>);
+      apiKey = cookies['collabKey'] || cookies['apiKey'];
+    }
+
+    // 4. Explicitly reject query params (DO NOT accept apiKey from client.handshake.query)
+    if (client.handshake.query?.apiKey || client.handshake.query?.collabKey) {
+      client.emit('error', { code: 'UNAUTHENTICATED', message: 'API key cannot be passed in URL query parameters' });
       client.disconnect(true);
       return;
     }
+
+    // Validate extracted key
+    if (!apiKey || apiKey !== expected) {
+      client.emit('error', { code: 'UNAUTHENTICATED', message: 'Invalid or missing API key' });
+      client.disconnect(true);
+      return;
+    }
+
     client.emit('connected', { ok: true });
   }
 
