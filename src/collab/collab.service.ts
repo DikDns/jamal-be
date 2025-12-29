@@ -6,10 +6,14 @@ import { z } from 'zod';
 import { createTLSchema } from '@tldraw/tlschema';
 import { Store } from '@tldraw/store';
 
-export type TLStore = {
+// Changed from 'export type' to 'interface' for Jest compatibility
+interface TLStore {
   schemaVersion?: number;
   records?: Record<string, any>;
-};
+}
+
+// Export for use in gateway
+export type { TLStore };
 
 // Minimal validation: TLStore with records object; TLRecord must have id & typeName
 const TLRecordSchema = z.object({
@@ -27,7 +31,7 @@ export class CollabService {
   constructor(
     @InjectRepository(Drawing)
     private readonly drawings: Repository<Drawing>,
-  ) {}
+  ) { }
 
   // TLSchema + Store for full validation
   private readonly tlschema = createTLSchema();
@@ -37,9 +41,9 @@ export class CollabService {
     assets: {
       upload: async () => ({ src: '' }),
       resolve: async () => '',
-      remove: async () => {},
+      remove: async () => { },
     },
-    onMount: () => {},
+    onMount: () => { },
     collaboration: { status: null },
   };
 
@@ -63,19 +67,12 @@ export class CollabService {
 
   // Set full store with optimistic concurrency (version must be prev+1)
   async setStore(roomId: string, nextStore: TLStore, nextVersion: number): Promise<Drawing> {
-    // Validate payload using official TLSchema/Store
-    try {
-      // create Store instance for validation; supply minimal props
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const store = new Store({ schema: this.tlschema as any, props: this.storeProps as any } as any);
-      // loadStoreSnapshot will validate records according to TLSchema
-      // Accept either serialized store or snapshot shapes
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      (store as any).loadStoreSnapshot(nextStore as any);
-      // If no error thrown, snapshot is valid
-    } catch (err) {
-      throw new BadRequestException(`Invalid TLStore payload: ${err?.message ?? err}`);
+    // Validate payload using Zod schema (fast, doesn't hang)
+    const parsed = TLStoreSchema.safeParse(nextStore);
+    if (!parsed.success) {
+      throw new BadRequestException(`Invalid TLStore payload: ${parsed.error.message}`);
     }
+
 
     const current = await this.drawings.findOne({ where: { roomId } });
     if (!current) throw new NotFoundException('Room not found');
@@ -117,46 +114,47 @@ export class CollabService {
       throw new ConflictException(`Version conflict. current=${current.version}, base=${baseVersion}`);
     }
 
-    // Apply patch using TLSchema-backed Store to validate
+    // Apply patch using simple object manipulation (no TLSchema to avoid hanging)
     try {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const store = new Store({ schema: this.tlschema as any, props: this.storeProps as any } as any);
-      // load current snapshot
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      (store as any).loadStoreSnapshot(current.store as any);
+      // Clone current store records
+      const records = { ...(current.store?.records || {}) };
 
-      // apply puts
+      // Apply puts - add new records
       if (changes.put && changes.put.length > 0) {
-        // store.put will validate records
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        (store as any).put(changes.put as any[]);
+        for (const record of changes.put) {
+          if (!record.id) throw new BadRequestException('Put record must have id');
+          records[record.id] = record;
+        }
       }
 
-      // apply updates
+      // Apply updates - merge with existing records
       for (const upd of changes.update ?? []) {
-        if (!upd?.id || typeof upd.after !== 'object') throw new BadRequestException('Invalid update entry');
-        const existing = (store as any).get(upd.id);
-        const merged = { ...(existing ?? {}), ...upd.after };
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        (store as any).put([merged as any]);
+        if (!upd?.id || typeof upd.after !== 'object') {
+          throw new BadRequestException('Invalid update entry');
+        }
+        const existing = records[upd.id] || {};
+        records[upd.id] = { ...existing, ...upd.after };
       }
 
-      // apply removes
+      // Apply removes - delete records
       if (changes.remove && changes.remove.length > 0) {
-        const ids = changes.remove.map((r) => r.id);
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        (store as any).remove(ids as any[]);
+        for (const rem of changes.remove) {
+          delete records[rem.id];
+        }
       }
 
-      // get snapshot after changes and persist
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const snapshot = (store as any).getStoreSnapshot();
+      // Build new store
+      const nextStore: TLStore = {
+        schemaVersion: current.store?.schemaVersion || 1,
+        records,
+      };
+
       const nextVersion = current.version + 1;
 
       const result = await this.drawings
         .createQueryBuilder()
         .update(Drawing)
-        .set({ store: snapshot as any, version: nextVersion })
+        .set({ store: nextStore as any, version: nextVersion })
         .where('room_id = :roomId AND version = :version', { roomId, version: baseVersion })
         .returning('*')
         .execute();
@@ -168,6 +166,7 @@ export class CollabService {
       return result.raw[0] as Drawing;
     } catch (err) {
       if (err instanceof BadRequestException) throw err;
+      if (err instanceof ConflictException) throw err;
       throw new BadRequestException(`Invalid patch or records: ${err?.message ?? err}`);
     }
   }
