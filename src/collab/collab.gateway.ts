@@ -31,7 +31,7 @@ export class CollabGateway implements OnGatewayConnection {
   @WebSocketServer()
   server!: Server;
 
-  constructor(private readonly collab: CollabService) {}
+  constructor(private readonly collab: CollabService) { }
 
   handleConnection(client: Socket) {
     // Strict auth validation: accept only auth object, Authorization header, or cookies
@@ -102,7 +102,7 @@ export class CollabGateway implements OnGatewayConnection {
   }
 
   @SubscribeMessage('store:set')
-  async handleSet(@MessageBody() body: StoreSetPayload) {
+  async handleSet(@MessageBody() body: StoreSetPayload, @ConnectedSocket() client: Socket) {
     try {
       // Limit payload size (~2MB) to prevent abuse
       const approx = JSON.stringify(body?.store ?? {}).length;
@@ -112,13 +112,14 @@ export class CollabGateway implements OnGatewayConnection {
       const { roomId, store, version } = body;
       const updated = await this.collab.setStore(roomId, store, version);
       this.server.to(roomId).emit('store:updated', { roomId, store: updated.store, version: updated.version });
+      client.emit('store:confirmed', { roomId, version: updated.version });
     } catch (err: any) {
       this.emitError(body?.roomId, err);
     }
   }
 
   @SubscribeMessage('store:patch')
-  async handlePatch(@MessageBody() body: StorePatchPayload) {
+  async handlePatch(@MessageBody() body: StorePatchPayload, @ConnectedSocket() client: Socket) {
     try {
       const approx = JSON.stringify(body?.changes ?? {}).length;
       if (approx > 1_000_000) {
@@ -127,9 +128,21 @@ export class CollabGateway implements OnGatewayConnection {
       const { roomId, baseVersion, changes } = body;
       const updated = await this.collab.applyPatch(roomId, baseVersion, changes);
       this.server.to(roomId).emit('store:updated', { roomId, store: updated.store, version: updated.version });
+      client.emit('store:confirmed', { roomId, version: updated.version });
     } catch (err: any) {
       this.emitError(body?.roomId, err);
     }
+  }
+
+  // Ephemeral presence update - broadcasts cursor position without DB persistence
+  @SubscribeMessage('presence:update')
+  handlePresence(
+    @MessageBody() body: { roomId: string; odId: string; name: string; color: string; cursor: { x: number; y: number } | null },
+    @ConnectedSocket() client: Socket,
+  ) {
+    const { roomId, odId, name, color, cursor } = body;
+    // Broadcast to everyone in the room except sender
+    client.to(roomId).emit('presence:updated', { roomId, odId, name, color, cursor });
   }
 
   private emitError(roomId: string | undefined, err: any) {
